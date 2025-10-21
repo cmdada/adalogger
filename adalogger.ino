@@ -11,8 +11,10 @@
   - Error logging and statistics
   - Downloadable logs from memory
   - Real-time CAN traffic monitoring
+  - Relay control based on RoboRIO enable signal
   
   CAN: TX=IO4, RX=IO5 (external transceiver required if not using pcb)
+  Relay: IO2 (active HIGH)
   Bitrate: 1 Mbps
   WiFi AP: SSID="adaloger", Password="blackknights2036"
   Web Interface: http://192.168.4.1
@@ -35,6 +37,11 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 static constexpr int CAN_TX_PIN = 4;
 static constexpr int CAN_RX_PIN = 5;
 static constexpr uint32_t CAN_BITRATE = 1000000; // 1 Mbps
+
+// ========= Relay Configuration =========
+static constexpr int RELAY_PIN = 2;
+static constexpr uint32_t ENABLE_HEARTBEAT_TIMEOUT_MS = 500; // 500ms without heartbeat = flash
+static constexpr uint32_t FLASH_INTERVAL_MS = 250; // Flash rate when no heartbeat
 
 // ========= FRC CAN Spec Definitions =========
 // Device types from FRC CAN specification
@@ -181,6 +188,16 @@ struct CANDevice {
 std::map<uint32_t, CANDevice> g_devices;
 SemaphoreHandle_t g_devicesMutex;
 
+// ========= Robot Enable State =========
+struct RobotEnableState {
+  bool isEnabled;
+  uint32_t lastEnableHeartbeatMs;
+  bool heartbeatActive;
+};
+
+RobotEnableState g_robotState = {false, 0, false};
+SemaphoreHandle_t g_robotStateMutex;
+
 // ========= Statistics =========
 struct CANStats {
   uint32_t totalMessages;
@@ -264,6 +281,77 @@ void addLogEntry(const twai_message_t& msg, bool isError = false, const char* er
   }
 }
 
+// ========= Robot Enable Signal Detection =========
+// Check if message is from RoboRIO and contains enable signal
+bool isRobotControllerEnableMessage(const twai_message_t& msg) {
+  if (!msg.extd) return false; // Must be extended frame
+  
+  FRCCANIdentifier id = decodeFRCCANID(msg.identifier);
+  
+  // Check if it's from Robot Controller (device type 1)
+  // and manufacturer is NI (National Instruments, value 1)
+  if (id.deviceType == ROBOT_CONTROLLER && id.manufacturer == NI) {
+    return true;
+  }
+  
+  return false;
+}
+
+// Extract enable state from RoboRIO CAN message
+bool extractEnableState(const twai_message_t& msg) {
+  // The enable state is typically in the first byte of RoboRIO status messages
+  // Bit 0 of data[0] indicates enabled state
+  if (msg.data_length_code > 0) {
+    return (msg.data[0] & 0x01) != 0;
+  }
+  return false;
+}
+
+// ========= Relay Control Task =========
+void RelayControlTask(void* param) {
+  uint32_t lastFlashToggle = 0;
+  bool flashState = false;
+  
+  while (true) {
+    bool shouldBeOn = false;
+    bool shouldFlash = false;
+    
+    if (xSemaphoreTake(g_robotStateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      uint32_t timeSinceHeartbeat = millis() - g_robotState.lastEnableHeartbeatMs;
+      
+      if (g_robotState.heartbeatActive && timeSinceHeartbeat < ENABLE_HEARTBEAT_TIMEOUT_MS) {
+        // Heartbeat is active and recent
+        if (g_robotState.isEnabled) {
+          shouldBeOn = true; // Solid ON when enabled
+        } else {
+          shouldBeOn = false; // Solid OFF when disabled but heartbeat present
+        }
+      } else {
+        // No heartbeat or stale heartbeat - flash the relay
+        shouldFlash = true;
+      }
+      
+      xSemaphoreGive(g_robotStateMutex);
+    }
+    
+    if (shouldFlash) {
+      // Flash relay at defined interval
+      if (millis() - lastFlashToggle >= FLASH_INTERVAL_MS) {
+        flashState = !flashState;
+        digitalWrite(RELAY_PIN, flashState ? HIGH : LOW);
+        lastFlashToggle = millis();
+      }
+    } else {
+      // Solid state
+      digitalWrite(RELAY_PIN, shouldBeOn ? HIGH : LOW);
+      flashState = false;
+      lastFlashToggle = millis();
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
 // ========= CAN Monitoring Task =========
 void CANMonitorTask(void* param) {
   twai_message_t msg;
@@ -292,6 +380,17 @@ void CANMonitorTask(void* param) {
     // Receive messages
     esp_err_t result = twai_receive(&msg, pdMS_TO_TICKS(10));
     if (result == ESP_OK) {
+      // Check for Robot Controller enable messages
+      if (isRobotControllerEnableMessage(msg)) {
+        bool enableState = extractEnableState(msg);
+        if (xSemaphoreTake(g_robotStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+          g_robotState.isEnabled = enableState;
+          g_robotState.lastEnableHeartbeatMs = millis();
+          g_robotState.heartbeatActive = true;
+          xSemaphoreGive(g_robotStateMutex);
+        }
+      }
+      
       // Update statistics
       if (xSemaphoreTake(g_statsMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         g_stats.totalMessages++;
@@ -433,6 +532,20 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
     .error { color: #ff6b6b; font-weight: bold; }
     .active { color: #51cf66; }
     .inactive { color: #ffd43b; opacity: 0.7; }
+    .relay-status {
+      display: inline-block;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-weight: bold;
+      margin-left: 10px;
+    }
+    .relay-enabled { background: #51cf66; color: #000; }
+    .relay-disabled { background: #868e96; color: #fff; }
+    .relay-flashing { background: #ffd43b; color: #000; animation: pulse 1s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
     @media (max-width: 768px) {
       body { padding: 10px; }
       h1 { font-size: 1.5em; }
@@ -464,6 +577,24 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
         <div class="stat-label">Uptime</div>
         <div class="stat-value" id="uptime">0s</div>
       </div>
+    </div>
+    
+    <div class="section">
+      <h2>Robot Status</h2>
+      <table>
+        <tr>
+          <td><strong>Enable State</strong></td>
+          <td><span id="enableState">Unknown</span></td>
+        </tr>
+        <tr>
+          <td><strong>Heartbeat</strong></td>
+          <td><span id="heartbeatState">No Signal</span></td>
+        </tr>
+        <tr>
+          <td><strong>Relay Output</strong></td>
+          <td><span id="relayState" class="relay-status relay-disabled">Unknown</span></td>
+        </tr>
+      </table>
     </div>
     
     <div class="section">
@@ -518,6 +649,36 @@ const char HTML_INDEX[] PROGMEM = R"rawliteral(
           document.getElementById('arbLostErr').textContent = data.arbLostErrors;
           document.getElementById('rxQueueErr').textContent = data.rxQueueFull;
           document.getElementById('txQueueErr').textContent = data.txQueueFull;
+          
+          // Update robot enable state
+          const enableEl = document.getElementById('enableState');
+          if (data.robotEnabled) {
+            enableEl.innerHTML = '<span class="active">●</span> ENABLED';
+          } else {
+            enableEl.innerHTML = '<span style="color:#868e96">●</span> DISABLED';
+          }
+          
+          // Update heartbeat state
+          const heartbeatEl = document.getElementById('heartbeatState');
+          if (data.heartbeatActive) {
+            heartbeatEl.innerHTML = '<span class="active">●</span> Active';
+          } else {
+            heartbeatEl.innerHTML = '<span class="error">●</span> Lost';
+          }
+          
+          // Update relay state
+          const relayEl = document.getElementById('relayState');
+          relayEl.className = 'relay-status';
+          if (!data.heartbeatActive) {
+            relayEl.className += ' relay-flashing';
+            relayEl.textContent = 'FLASHING (No Heartbeat)';
+          } else if (data.robotEnabled) {
+            relayEl.className += ' relay-enabled';
+            relayEl.textContent = 'ON (Enabled)';
+          } else {
+            relayEl.className += ' relay-disabled';
+            relayEl.textContent = 'OFF (Disabled)';
+          }
         });
       
       fetch('/api/devices')
