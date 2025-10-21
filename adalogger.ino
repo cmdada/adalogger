@@ -14,7 +14,7 @@
   - Relay control based on RoboRIO enable signal
   
   CAN: TX=IO4, RX=IO5 (external transceiver required if not using pcb)
-  Relay: IO2 (active HIGH)
+  Relay: IO25 (active HIGH)
   Bitrate: 1 Mbps
   WiFi AP: SSID="adaloger", Password="blackknights2036"
   Web Interface: http://192.168.4.1
@@ -39,7 +39,7 @@ static constexpr int CAN_RX_PIN = 5;
 static constexpr uint32_t CAN_BITRATE = 1000000; // 1 Mbps
 
 // ========= Relay Configuration =========
-static constexpr int RELAY_PIN = 2;
+static constexpr int RELAY_PIN = 25;
 static constexpr uint32_t ENABLE_HEARTBEAT_TIMEOUT_MS = 500; // 500ms without heartbeat = flash
 static constexpr uint32_t FLASH_INTERVAL_MS = 250; // Flash rate when no heartbeat
 
