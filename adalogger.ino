@@ -9,9 +9,9 @@
   - Web interface showing live CAN devices
   - FRC CAN spec device identification
   - Error logging and statistics
-  - Downloadable logs from memory
-  - Real-time CAN traffic monitoring
-  - Relay control based on RoboRIO enable signal
+  - Downloadable logs from memory -- WIFI ONLY
+  - Real-time CAN traffic monitoring -- WIFI ONLY
+  - Relay control based on RoboRIO enable signal for our breaker leds
   
   CAN: TX=IO4, RX=IO5 (external transceiver required if not using pcb)
   Relay: IO25 (active HIGH)
@@ -22,7 +22,11 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
-#include "driver/twai.h"
+
+#include "driver/twai.h" 
+//https://docs.espressif.com/projects/esp-idf/en/stable/esp32s2/api-reference/peripherals/twai.html
+// for the canbus transciever
+
 #include <vector>
 #include <map>
 
