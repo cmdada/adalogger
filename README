@@ -1,0 +1,22 @@
+  adalogger
+  Creates WiFi hotspot and serves CAN message logs via minimal HTML interface
+  Transmits heartbeat so it appears as a visible device on the FRC CAN bus
+  
+  Pins:
+    RED_PIN   = 15 (LEDC PWM)
+    GREEN_PIN = 13 (LEDC PWM)
+    BLUE_PIN  = 14 (LEDC PWM)
+    CAN TX    = GPIO 4
+    CAN RX    = GPIO 5
+  
+  Status LED Indicators:
+    - Booting: Pulsing blue
+    - WiFi AP Ready: Solid green
+    - CAN Active: Green with blue flashes on activity
+    - CAN Error: Red pulsing
+    - High traffic: Faster blue flashes
+  
+  Serial Commands:
+    &CANID SET xx   (0..63 live)
+    &CANID SAVE     (EEPROM + reboot)
+    &CANID GET
