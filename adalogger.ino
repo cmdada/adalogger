@@ -4,8 +4,18 @@
   Transmits heartbeat so it appears as a visible device on the FRC CAN bus
   
   Pins:
-    CAN TX = GPIO 4
-    CAN RX = GPIO 5
+    RED_PIN   = 15 (LEDC PWM)
+    GREEN_PIN = 13 (LEDC PWM)
+    BLUE_PIN  = 14 (LEDC PWM)
+    CAN TX    = GPIO 4
+    CAN RX    = GPIO 5
+  
+  Status LED Indicators:
+    - Booting: Pulsing blue
+    - WiFi AP Ready: Solid green
+    - CAN Active: Green with blue flashes on activity
+    - CAN Error: Red pulsing
+    - High traffic: Faster blue flashes
   
   Serial Commands:
     &CANID SET xx   (0..63 live)
@@ -17,10 +27,16 @@
 #include <WebServer.h>
 #include <EEPROM.h>
 #include "driver/twai.h"
+#include "driver/ledc.h"
 
 // WiFi AP credentials
 const char* ssid = "FRC-CAN-Logger";
 const char* password = "frclogger";
+
+// Status LED pins
+#define RED_PIN    15
+#define GREEN_PIN  13
+#define BLUE_PIN   14
 
 // CAN Bus pins
 #define CAN_TX_PIN GPIO_NUM_4
@@ -28,6 +44,15 @@ const char* password = "frclogger";
 
 // EEPROM
 #define EEPROM_BYTES 64
+
+// LEDC (PWM) configuration
+static const uint32_t LEDC_FREQ_HZ = 4000;
+static const ledc_timer_bit_t LEDC_RES_BITS = LEDC_TIMER_12_BIT;
+static const ledc_mode_t  LEDC_MODE  = LEDC_LOW_SPEED_MODE;
+static const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
+static const ledc_channel_t LEDC_CH_RED   = LEDC_CHANNEL_0;
+static const ledc_channel_t LEDC_CH_GREEN = LEDC_CHANNEL_1;
+static const ledc_channel_t LEDC_CH_BLUE  = LEDC_CHANNEL_2;
 
 WebServer server(80);
 
@@ -50,8 +75,8 @@ WebServer server(80);
 #define API_CLASS_FIRMWARE 0x1F
 
 // Custom APIs for logger
-#define API_TX_STATUS   0x1A0  // Logger status message
-#define API_TX_HEARTBEAT 0x1A1 // Logger heartbeat
+#define API_TX_STATUS   0x1A0
+#define API_TX_HEARTBEAT 0x1A1
 
 // Software version
 #define SOFTWARE_VER 1
@@ -64,7 +89,7 @@ struct CANLog {
   uint8_t len;
   unsigned long timestamp;
   bool is_extended;
-  bool is_tx;  // true if we transmitted it
+  bool is_tx;
 };
 
 CANLog logs[MAX_LOGS];
@@ -76,6 +101,19 @@ bool can_started = false;
 // Device state
 volatile uint8_t g_deviceNumber = DEFAULT_DEVICE_NUMBER;
 volatile uint16_t g_uptimeSec = 0;
+
+// LED state
+enum LEDState {
+  LED_BOOTING,
+  LED_WIFI_READY,
+  LED_CAN_ACTIVE,
+  LED_CAN_ERROR
+};
+volatile LEDState g_ledState = LED_BOOTING;
+volatile uint16_t g_ledR_12 = 0, g_ledG_12 = 0, g_ledB_12 = 0;
+volatile uint16_t g_ledR_target = 0, g_ledG_target = 0, g_ledB_target = 0;
+volatile uint32_t g_lastCANActivity = 0;
+volatile uint16_t g_recentMessageCount = 0;
 
 // FRC CAN ID helpers
 static inline uint32_t encode_id(uint8_t dt, uint8_t man, uint16_t api, uint8_t dn) {
@@ -104,6 +142,48 @@ void EEPROMSaveCANID() {
   EEPROM.commit();
 }
 
+// LED control functions
+void LED_Init() {
+  ledc_timer_config_t tcfg = {};
+  tcfg.speed_mode       = LEDC_MODE;
+  tcfg.duty_resolution  = LEDC_RES_BITS;
+  tcfg.timer_num        = LEDC_TIMER;
+  tcfg.freq_hz          = LEDC_FREQ_HZ;
+  tcfg.clk_cfg          = LEDC_AUTO_CLK;
+  ledc_timer_config(&tcfg);
+
+  ledc_channel_config_t chR = {};
+  chR.gpio_num   = RED_PIN;
+  chR.speed_mode = LEDC_MODE;
+  chR.channel    = LEDC_CH_RED;
+  chR.intr_type  = LEDC_INTR_DISABLE;
+  chR.timer_sel  = LEDC_TIMER;
+  chR.duty       = 0;
+  chR.hpoint     = 0;
+  ledc_channel_config(&chR);
+
+  ledc_channel_config_t chG = chR; 
+  chG.gpio_num = GREEN_PIN; 
+  chG.channel = LEDC_CH_GREEN;
+  ledc_channel_config(&chG);
+
+  ledc_channel_config_t chB = chR; 
+  chB.gpio_num = BLUE_PIN;  
+  chB.channel = LEDC_CH_BLUE;
+  ledc_channel_config(&chB);
+}
+
+void LED_SetTarget(uint16_t r, uint16_t g, uint16_t b) {
+  g_ledR_target = r;
+  g_ledG_target = g;
+  g_ledB_target = b;
+}
+
+void LED_SetTargetRGB8(uint8_t r8, uint8_t g8, uint8_t b8) {
+  LED_SetTarget(((uint16_t)r8) << 4, ((uint16_t)g8) << 4, ((uint16_t)b8) << 4);
+}
+
+// CAN functions
 bool CAN_Start() {
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
   g_config.tx_queue_len = 10;
@@ -137,8 +217,10 @@ bool CAN_Send(uint32_t id, const uint8_t data[8], int dlc = 8) {
   
   bool success = (twai_transmit(&msg, pdMS_TO_TICKS(20)) == ESP_OK);
   
-  // Log our own transmissions
   if (success) {
+    g_lastCANActivity = millis();
+    g_recentMessageCount++;
+    
     logs[logIndex].id = id;
     logs[logIndex].len = dlc;
     logs[logIndex].is_extended = true;
@@ -154,6 +236,151 @@ bool CAN_Send(uint32_t id, const uint8_t data[8], int dlc = 8) {
   return success;
 }
 
+// LED Animation Task
+void TaskLEDControl(void* parameter) {
+  Serial.println("[LED] Task started");
+  const uint16_t step = 64;
+  uint32_t lastPulse = 0;
+  uint32_t pulsePhase = 0;
+  
+  while (true) {
+    uint32_t now = millis();
+    
+    // Update LED targets based on state
+    switch (g_ledState) {
+      case LED_BOOTING:
+        // Pulsing blue
+        if (now - lastPulse >= 20) {
+          lastPulse = now;
+          pulsePhase = (pulsePhase + 1) % 100;
+          uint16_t brightness = (pulsePhase < 50) ? (pulsePhase * 40) : ((100 - pulsePhase) * 40);
+          LED_SetTarget(0, 0, brightness);
+        }
+        break;
+        
+      case LED_WIFI_READY:
+        // Solid green
+        LED_SetTargetRGB8(0, 128, 0);
+        break;
+        
+      case LED_CAN_ACTIVE:
+        // Green base with blue flash on activity
+        if (now - g_lastCANActivity < 100) {
+          // Recent activity - flash blue
+          uint16_t intensity = 4095 - ((now - g_lastCANActivity) * 40);
+          if (intensity > 4095) intensity = 0;
+          LED_SetTarget(0, 2048, intensity);
+        } else {
+          // Idle - solid green
+          LED_SetTargetRGB8(0, 128, 0);
+        }
+        break;
+        
+      case LED_CAN_ERROR:
+        // Pulsing red
+        if (now - lastPulse >= 30) {
+          lastPulse = now;
+          pulsePhase = (pulsePhase + 1) % 100;
+          uint16_t brightness = (pulsePhase < 50) ? (pulsePhase * 40) : ((100 - pulsePhase) * 40);
+          LED_SetTarget(brightness, 0, 0);
+        }
+        break;
+    }
+    
+    // Smooth fade toward targets
+    uint16_t curR = g_ledR_12;
+    uint16_t curG = g_ledG_12;
+    uint16_t curB = g_ledB_12;
+    
+    uint16_t tgtR = g_ledR_target;
+    uint16_t tgtG = g_ledG_target;
+    uint16_t tgtB = g_ledB_target;
+    
+    // Red
+    if (curR < tgtR) {
+      uint32_t next = (uint32_t)curR + step;
+      if (next > tgtR) next = tgtR;
+      curR = (uint16_t)next;
+    } else if (curR > tgtR) {
+      uint16_t next = (curR > step) ? (curR - step) : 0;
+      if (next < tgtR) next = tgtR;
+      curR = next;
+    }
+    
+    // Green
+    if (curG < tgtG) {
+      uint32_t next = (uint32_t)curG + step;
+      if (next > tgtG) next = tgtG;
+      curG = (uint16_t)next;
+    } else if (curG > tgtG) {
+      uint16_t next = (curG > step) ? (curG - step) : 0;
+      if (next < tgtG) next = tgtG;
+      curG = next;
+    }
+    
+    // Blue
+    if (curB < tgtB) {
+      uint32_t next = (uint32_t)curB + step;
+      if (next > tgtB) next = tgtB;
+      curB = (uint16_t)next;
+    } else if (curB > tgtB) {
+      uint16_t next = (curB > step) ? (curB - step) : 0;
+      if (next < tgtB) next = tgtB;
+      curB = next;
+    }
+    
+    g_ledR_12 = curR;
+    g_ledG_12 = curG;
+    g_ledB_12 = curB;
+    
+    // Apply PWM
+    ledc_set_duty(LEDC_MODE, LEDC_CH_RED, curR);
+    ledc_update_duty(LEDC_MODE, LEDC_CH_RED);
+    
+    ledc_set_duty(LEDC_MODE, LEDC_CH_GREEN, curG);
+    ledc_update_duty(LEDC_MODE, LEDC_CH_GREEN);
+    
+    ledc_set_duty(LEDC_MODE, LEDC_CH_BLUE, curB);
+    ledc_update_duty(LEDC_MODE, LEDC_CH_BLUE);
+    
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
+// CAN Health Monitor Task
+void TaskCANHealth(void* parameter) {
+  Serial.println("[CANHEALTH] Task started");
+  uint32_t lastCheck = 0;
+  
+  while (true) {
+    uint32_t now = millis();
+    
+    if (now - lastCheck >= 1000) {
+      lastCheck = now;
+      
+      if (!can_started) {
+        g_ledState = LED_CAN_ERROR;
+      } else {
+        // Check CAN bus state
+        twai_status_info_t status;
+        if (twai_get_status_info(&status) == ESP_OK) {
+          if (status.state == TWAI_STATE_BUS_OFF || status.state == TWAI_STATE_RECOVERING) {
+            g_ledState = LED_CAN_ERROR;
+            Serial.println("[CANHEALTH] Bus error detected");
+          } else if (g_ledState != LED_CAN_ACTIVE) {
+            g_ledState = LED_CAN_ACTIVE;
+          }
+        }
+      }
+      
+      // Reset recent message counter
+      g_recentMessageCount = 0;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 void TaskCANTx(void* parameter) {
   Serial.println("[CANTX] Task started");
   uint32_t lastStatus = 0;
@@ -163,14 +390,11 @@ void TaskCANTx(void* parameter) {
   while (true) {
     uint32_t now = millis();
 
-    // Update uptime (saturate at 0xFFFF)
     if (now - lastSecTick >= 1000) {
       lastSecTick += 1000;
       if (g_uptimeSec < 0xFFFF) g_uptimeSec++;
     }
 
-    // Status message at ~2 Hz (API 0x1A0)
-    // Format: [software_ver, uptime_lo, uptime_hi, msg_count_lo, msg_count_hi, 0, 0, 0]
     if (now - lastStatus >= 500) {
       lastStatus = now;
       uint8_t buf[8] = {0};
@@ -183,12 +407,10 @@ void TaskCANTx(void* parameter) {
       CAN_Send(make_can_id(API_TX_STATUS), buf, 8);
     }
 
-    // Heartbeat at ~10 Hz (API 0x1A1)
-    // Simple presence beacon
     if (now - lastHeartbeat >= 100) {
       lastHeartbeat = now;
       uint8_t buf[8] = {0};
-      buf[0] = 0xAA; // Magic byte
+      buf[0] = 0xAA;
       buf[1] = (uint8_t)g_deviceNumber;
       CAN_Send(make_can_id(API_TX_HEARTBEAT), buf, 8);
     }
@@ -230,9 +452,13 @@ void TaskCANIDHelper(void* parameter) {
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n=== adalogger ===");
+  Serial.println("\n=== adalogger with Status LEDs ===");
   
   startTime = millis();
+  
+  // Initialize LEDs first (booting state)
+  LED_Init();
+  g_ledState = LED_BOOTING;
   
   // EEPROM
   EEPROM.begin(EEPROM_BYTES);
@@ -242,6 +468,7 @@ void setup() {
   // Initialize CAN bus
   if (!CAN_Start()) {
     Serial.println("[BOOT] CAN init failed. Retrying in 3s...");
+    g_ledState = LED_CAN_ERROR;
     delay(3000);
     CAN_Start();
   }
@@ -252,6 +479,15 @@ void setup() {
   Serial.print("[WIFI] AP IP: ");
   Serial.println(IP);
   
+  // WiFi ready - change LED state
+  g_ledState = LED_WIFI_READY;
+  delay(500);
+  
+  // Once CAN is confirmed working, switch to active state
+  if (can_started) {
+    g_ledState = LED_CAN_ACTIVE;
+  }
+  
   // Web server routes
   server.on("/", handleRoot);
   server.on("/data", handleData);
@@ -261,6 +497,8 @@ void setup() {
   Serial.println("[BOOT] Web server started");
   
   // Start tasks
+  xTaskCreatePinnedToCore(TaskLEDControl, "TaskLEDControl", 4096, nullptr, 2, nullptr, 1);
+  xTaskCreatePinnedToCore(TaskCANHealth, "TaskCANHealth", 4096, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(TaskCANTx, "TaskCANTx", 4096, nullptr, 2, nullptr, 1);
   xTaskCreatePinnedToCore(TaskCANIDHelper, "TaskCANIDHelper", 4096, nullptr, 1, nullptr, 1);
   
@@ -275,6 +513,9 @@ void loop() {
     twai_message_t message;
     esp_err_t r = twai_receive(&message, pdMS_TO_TICKS(10));
     if (r == ESP_OK) {
+      g_lastCANActivity = millis();
+      g_recentMessageCount++;
+      
       logs[logIndex].id = message.identifier;
       logs[logIndex].len = message.data_length_code;
       logs[logIndex].is_extended = message.extd;
@@ -291,7 +532,7 @@ void loop() {
 }
 
 void handleRoot() {
-  String html = "<html><head><title> adalogger</title>";
+  String html = "<html><head><title>adalogger</title>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<script>";
   html += "function refresh(){fetch('/data').then(r=>r.text()).then(d=>{document.getElementById('log').innerHTML=d;})}";
@@ -301,6 +542,17 @@ void handleRoot() {
   html += "<h1>adalogger</h1>";
   html += "<p>Device Number: " + String(g_deviceNumber) + "</p>";
   html += "<p>Uptime: " + String(g_uptimeSec) + "s</p>";
+  
+  // Status indicator
+  html += "<p>Status: ";
+  switch (g_ledState) {
+    case LED_BOOTING: html += "🔵 Booting"; break;
+    case LED_WIFI_READY: html += "🟢 WiFi Ready"; break;
+    case LED_CAN_ACTIVE: html += "🟢 CAN Active"; break;
+    case LED_CAN_ERROR: html += "🔴 CAN Error"; break;
+  }
+  html += "</p>";
+  
   html += "<p>Messages: <span id='count'>0</span></p>";
   html += "<button onclick='refresh()'>Refresh</button> ";
   html += "<button onclick='clear()'>Clear</button><hr>";
@@ -327,13 +579,11 @@ void handleData() {
     response += "<td>" + String(log->timestamp) + "</td>";
     response += "<td>0x" + String(log->id, HEX) + "</td>";
     
-    // Decode FRC CAN ID
     if (log->is_extended) {
       uint8_t deviceType, manufacturer, deviceNumber;
       uint16_t apiClass;
       decode_id(log->id, deviceType, manufacturer, apiClass, deviceNumber);
       
-      // Check if it's FRC format
       if (deviceType == DEVICE_ID && manufacturer == MANUFACTURER_ID) {
         response += "<td>FRC</td>";
         response += "<td>" + getAPIClassName(apiClass) + "</td>";
@@ -347,7 +597,6 @@ void handleData() {
       response += "<td>Std</td><td>-</td><td>-</td>";
     }
     
-    // Data bytes
     response += "<td>";
     for (int j = 0; j < log->len; j++) {
       if (j > 0) response += " ";
