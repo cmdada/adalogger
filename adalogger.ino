@@ -1,643 +1,772 @@
 /*
-  adalogger
-  Creates WiFi hotspot and serves CAN message logs via minimal HTML interface
-  Transmits heartbeat so it appears as a visible device on the FRC CAN bus
-  
-  Pins:
-    RED_PIN   = 15 (LEDC PWM)
-    GREEN_PIN = 13 (LEDC PWM)
-    BLUE_PIN  = 14 (LEDC PWM)
-    CAN TX    = GPIO 4
-    CAN RX    = GPIO 5
-  
-  Status LED Indicators:
-    - Booting: Pulsing blue
-    - WiFi AP Ready: Solid green
-    - CAN Active: Green with blue flashes on activity
-    - CAN Error: Red pulsing
-    - High traffic: Faster blue flashes
-  
-  Serial Commands:
-    &CANID SET xx   (0..63 live)
-    &CANID SAVE     (EEPROM + reboot)
-    &CANID GET
-*/
+ * IronMaple ESP32-FRC-devkit CAN Debug Tool
+ * Web-based CAN bus monitor and analyzer
+ * 
+ * Features:
+ * - WiFi Access Point mode
+ * - Real-time CAN message monitoring
+ * - FRC CAN message decoding
+ * - Message filtering and search
+ * - CAN message injection
+ * - Statistics and diagnostics
+ */
 
 #include <WiFi.h>
 #include <WebServer.h>
-#include <EEPROM.h>
-#include "driver/twai.h"
-#include "driver/ledc.h"
+#include <driver/twai.h>
+#include <ArduinoJson.h>
 
-// WiFi AP credentials
-const char* ssid = "FRC-CAN-Logger";
-const char* password = "frclogger";
+// === WiFi Configuration ===
+const char* ap_ssid = "ESP32-CAN-Debug";
+const char* ap_password = "12345678";  // Change this!
 
-// Status LED pins
-#define RED_PIN    15
-#define GREEN_PIN  13
-#define BLUE_PIN   14
+// === CAN Pin Configuration ===
+#define CAN_TX_PIN 4
+#define CAN_RX_PIN 5
 
-// CAN Bus pins
-#define CAN_TX_PIN GPIO_NUM_4
-#define CAN_RX_PIN GPIO_NUM_5
+// === LED Pins ===
+#define LED_R 15
+#define LED_G 13
+#define LED_B 14
 
-// EEPROM
-#define EEPROM_BYTES 64
+// === FRC CAN Constants ===
+#define HEARTBEAT_ID 0x01011840
 
-// LEDC (PWM) configuration
-static const uint32_t LEDC_FREQ_HZ = 4000;
-static const ledc_timer_bit_t LEDC_RES_BITS = LEDC_TIMER_12_BIT;
-static const ledc_mode_t  LEDC_MODE  = LEDC_LOW_SPEED_MODE;
-static const ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
-static const ledc_channel_t LEDC_CH_RED   = LEDC_CHANNEL_0;
-static const ledc_channel_t LEDC_CH_GREEN = LEDC_CHANNEL_1;
-static const ledc_channel_t LEDC_CH_BLUE  = LEDC_CHANNEL_2;
-
+// === Web Server ===
 WebServer server(80);
 
-// FRC CAN constants
-#define DEVICE_ID       0x0A
-#define MANUFACTURER_ID 0x08
-#define DEFAULT_DEVICE_NUMBER 10
-
-// FRC CAN API classes
-#define API_CLASS_ROBOT_CONTROL 0x00
-#define API_CLASS_MOTOR_CONTROL 0x02
-#define API_CLASS_RELAY_CONTROL 0x03
-#define API_CLASS_GYRO_SENSOR 0x04
-#define API_CLASS_ACCEL_SENSOR 0x05
-#define API_CLASS_ULTRASONIC 0x06
-#define API_CLASS_GEAR_TOOTH 0x07
-#define API_CLASS_MISC_SENSOR 0x08
-#define API_CLASS_IO_CONFIG 0x09
-#define API_CLASS_POWER 0x0A
-#define API_CLASS_FIRMWARE 0x1F
-
-// Custom APIs for logger
-#define API_TX_STATUS   0x1A0
-#define API_TX_HEARTBEAT 0x1A1
-
-// Software version
-#define SOFTWARE_VER 1
-
-// Circular buffer for CAN messages
-#define MAX_LOGS 500
-struct CANLog {
+// === CAN Message Buffer ===
+#define MAX_MESSAGES 500
+struct CANMessage {
   uint32_t id;
   uint8_t data[8];
   uint8_t len;
-  unsigned long timestamp;
-  bool is_extended;
-  bool is_tx;
+  uint32_t timestamp;
+  bool extended;
 };
 
-CANLog logs[MAX_LOGS];
-int logIndex = 0;
-int logCount = 0;
-unsigned long startTime = 0;
-bool can_started = false;
+CANMessage messageBuffer[MAX_MESSAGES];
+int bufferIndex = 0;
+int totalMessages = 0;
+bool bufferOverflow = false;
 
-// Device state
-volatile uint8_t g_deviceNumber = DEFAULT_DEVICE_NUMBER;
-volatile uint16_t g_uptimeSec = 0;
+// === Statistics ===
+uint32_t rxCount = 0;
+uint32_t txCount = 0;
+uint32_t errCount = 0;
+uint32_t lastHeartbeat = 0;
 
-// LED state
-enum LEDState {
-  LED_BOOTING,
-  LED_WIFI_READY,
-  LED_CAN_ACTIVE,
-  LED_CAN_ERROR
+// === FRC CAN Decoding ===
+struct DecodedCANID {
+  uint8_t deviceID;
+  uint8_t manufacturerID;
+  uint16_t apiID;
+  uint8_t deviceNumber;
 };
-volatile LEDState g_ledState = LED_BOOTING;
-volatile uint16_t g_ledR_12 = 0, g_ledG_12 = 0, g_ledB_12 = 0;
-volatile uint16_t g_ledR_target = 0, g_ledG_target = 0, g_ledB_target = 0;
-volatile uint32_t g_lastCANActivity = 0;
-volatile uint16_t g_recentMessageCount = 0;
 
-// FRC CAN ID helpers
-static inline uint32_t encode_id(uint8_t dt, uint8_t man, uint16_t api, uint8_t dn) {
-  return ((uint32_t)dt << 24) | ((uint32_t)man << 16) | ((uint32_t)api << 6) | (dn & 0x3F);
+DecodedCANID decodeCANMsgID(uint32_t can_id) {
+  DecodedCANID decoded;
+  decoded.deviceID = (can_id >> 24) & 0xFF;
+  decoded.manufacturerID = (can_id >> 16) & 0xFF;
+  decoded.apiID = (can_id >> 6) & 0x3FF;
+  decoded.deviceNumber = can_id & 0x3F;
+  return decoded;
 }
 
-static inline void decode_id(uint32_t id, uint8_t &dt, uint8_t &man, uint16_t &api, uint8_t &dn) {
-  dt  = (id >> 24) & 0xFF;
-  man = (id >> 16) & 0xFF;
-  api = (id >> 6)  & 0x3FF;
-  dn  = id & 0x3F;
+uint32_t makeCANMsgID(uint8_t deviceID, uint8_t manufacturerID, uint16_t apiID, uint8_t deviceNumber) {
+  return ((uint32_t)(deviceID & 0xFF) << 24) | 
+         ((uint32_t)(manufacturerID & 0xFF) << 16) | 
+         ((uint32_t)(apiID & 0x3FF) << 6) | 
+         (deviceNumber & 0x3F);
 }
 
-static inline uint32_t make_can_id(uint16_t api) {
-  return encode_id(DEVICE_ID, MANUFACTURER_ID, api, (uint8_t)g_deviceNumber);
-}
-
-// EEPROM functions
-void EEPROMReadCANID() {
-  uint8_t saved = EEPROM.read(0);
-  g_deviceNumber = (saved <= 63) ? saved : DEFAULT_DEVICE_NUMBER;
-}
-
-void EEPROMSaveCANID() {
-  EEPROM.write(0, (uint8_t)g_deviceNumber);
-  EEPROM.commit();
-}
-
-// LED control functions
-void LED_Init() {
-  ledc_timer_config_t tcfg = {};
-  tcfg.speed_mode       = LEDC_MODE;
-  tcfg.duty_resolution  = LEDC_RES_BITS;
-  tcfg.timer_num        = LEDC_TIMER;
-  tcfg.freq_hz          = LEDC_FREQ_HZ;
-  tcfg.clk_cfg          = LEDC_AUTO_CLK;
-  ledc_timer_config(&tcfg);
-
-  ledc_channel_config_t chR = {};
-  chR.gpio_num   = RED_PIN;
-  chR.speed_mode = LEDC_MODE;
-  chR.channel    = LEDC_CH_RED;
-  chR.intr_type  = LEDC_INTR_DISABLE;
-  chR.timer_sel  = LEDC_TIMER;
-  chR.duty       = 0;
-  chR.hpoint     = 0;
-  ledc_channel_config(&chR);
-
-  ledc_channel_config_t chG = chR; 
-  chG.gpio_num = GREEN_PIN; 
-  chG.channel = LEDC_CH_GREEN;
-  ledc_channel_config(&chG);
-
-  ledc_channel_config_t chB = chR; 
-  chB.gpio_num = BLUE_PIN;  
-  chB.channel = LEDC_CH_BLUE;
-  ledc_channel_config(&chB);
-}
-
-void LED_SetTarget(uint16_t r, uint16_t g, uint16_t b) {
-  g_ledR_target = r;
-  g_ledG_target = g;
-  g_ledB_target = b;
-}
-
-void LED_SetTargetRGB8(uint8_t r8, uint8_t g8, uint8_t b8) {
-  LED_SetTarget(((uint16_t)r8) << 4, ((uint16_t)g8) << 4, ((uint16_t)b8) << 4);
-}
-
-// CAN functions
-bool CAN_Start() {
-  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_PIN, CAN_RX_PIN, TWAI_MODE_NORMAL);
-  g_config.tx_queue_len = 10;
-  g_config.rx_queue_len = 20;
-  g_config.clkout_divider = 0;
-
-  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();
+// === Setup Functions ===
+void setupCAN() {
+  twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
+  twai_timing_config_t t_config = TWAI_TIMING_CONFIG_1MBITS();  // FRC uses 1Mbps
   twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
-
-  if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
-    Serial.println("[CAN] Driver install failed");
-    return false;
-  }
-  if (twai_start() != ESP_OK) {
-    Serial.println("[CAN] Start failed");
-    twai_driver_uninstall();
-    return false;
-  }
-  can_started = true;
-  Serial.println("[CAN] Started at 1 Mbps");
-  return true;
-}
-
-bool CAN_Send(uint32_t id, const uint8_t data[8], int dlc = 8) {
-  if (!can_started) return false;
-  twai_message_t msg = {};
-  msg.identifier = id;
-  msg.extd = 1;
-  msg.data_length_code = dlc;
-  for (int i = 0; i < dlc && i < 8; ++i) msg.data[i] = data[i];
   
-  bool success = (twai_transmit(&msg, pdMS_TO_TICKS(20)) == ESP_OK);
-  
-  if (success) {
-    g_lastCANActivity = millis();
-    g_recentMessageCount++;
-    
-    logs[logIndex].id = id;
-    logs[logIndex].len = dlc;
-    logs[logIndex].is_extended = true;
-    logs[logIndex].is_tx = true;
-    logs[logIndex].timestamp = millis() - startTime;
-    for (int i = 0; i < dlc; ++i) {
-      logs[logIndex].data[i] = data[i];
-    }
-    logIndex = (logIndex + 1) % MAX_LOGS;
-    if (logCount < MAX_LOGS) logCount++;
+  if (twai_driver_install(&g_config, &t_config, &f_config) == ESP_OK) {
+    Serial.println("CAN driver installed");
+  } else {
+    Serial.println("Failed to install CAN driver");
+    return;
   }
   
-  return success;
-}
-
-// LED Animation Task
-void TaskLEDControl(void* parameter) {
-  Serial.println("[LED] Task started");
-  const uint16_t step = 64;
-  uint32_t lastPulse = 0;
-  uint32_t pulsePhase = 0;
-  
-  while (true) {
-    uint32_t now = millis();
-    
-    // Update LED targets based on state
-    switch (g_ledState) {
-      case LED_BOOTING:
-        // Pulsing blue
-        if (now - lastPulse >= 20) {
-          lastPulse = now;
-          pulsePhase = (pulsePhase + 1) % 100;
-          uint16_t brightness = (pulsePhase < 50) ? (pulsePhase * 40) : ((100 - pulsePhase) * 40);
-          LED_SetTarget(0, 0, brightness);
-        }
-        break;
-        
-      case LED_WIFI_READY:
-        // Solid green
-        LED_SetTargetRGB8(0, 128, 0);
-        break;
-        
-      case LED_CAN_ACTIVE:
-        // Green base with blue flash on activity
-        if (now - g_lastCANActivity < 100) {
-          // Recent activity - flash blue
-          uint16_t intensity = 4095 - ((now - g_lastCANActivity) * 40);
-          if (intensity > 4095) intensity = 0;
-          LED_SetTarget(0, 2048, intensity);
-        } else {
-          // Idle - solid green
-          LED_SetTargetRGB8(0, 128, 0);
-        }
-        break;
-        
-      case LED_CAN_ERROR:
-        // Pulsing red
-        if (now - lastPulse >= 30) {
-          lastPulse = now;
-          pulsePhase = (pulsePhase + 1) % 100;
-          uint16_t brightness = (pulsePhase < 50) ? (pulsePhase * 40) : ((100 - pulsePhase) * 40);
-          LED_SetTarget(brightness, 0, 0);
-        }
-        break;
-    }
-    
-    // Smooth fade toward targets
-    uint16_t curR = g_ledR_12;
-    uint16_t curG = g_ledG_12;
-    uint16_t curB = g_ledB_12;
-    
-    uint16_t tgtR = g_ledR_target;
-    uint16_t tgtG = g_ledG_target;
-    uint16_t tgtB = g_ledB_target;
-    
-    // Red
-    if (curR < tgtR) {
-      uint32_t next = (uint32_t)curR + step;
-      if (next > tgtR) next = tgtR;
-      curR = (uint16_t)next;
-    } else if (curR > tgtR) {
-      uint16_t next = (curR > step) ? (curR - step) : 0;
-      if (next < tgtR) next = tgtR;
-      curR = next;
-    }
-    
-    // Green
-    if (curG < tgtG) {
-      uint32_t next = (uint32_t)curG + step;
-      if (next > tgtG) next = tgtG;
-      curG = (uint16_t)next;
-    } else if (curG > tgtG) {
-      uint16_t next = (curG > step) ? (curG - step) : 0;
-      if (next < tgtG) next = tgtG;
-      curG = next;
-    }
-    
-    // Blue
-    if (curB < tgtB) {
-      uint32_t next = (uint32_t)curB + step;
-      if (next > tgtB) next = tgtB;
-      curB = (uint16_t)next;
-    } else if (curB > tgtB) {
-      uint16_t next = (curB > step) ? (curB - step) : 0;
-      if (next < tgtB) next = tgtB;
-      curB = next;
-    }
-    
-    g_ledR_12 = curR;
-    g_ledG_12 = curG;
-    g_ledB_12 = curB;
-    
-    // Apply PWM
-    ledc_set_duty(LEDC_MODE, LEDC_CH_RED, curR);
-    ledc_update_duty(LEDC_MODE, LEDC_CH_RED);
-    
-    ledc_set_duty(LEDC_MODE, LEDC_CH_GREEN, curG);
-    ledc_update_duty(LEDC_MODE, LEDC_CH_GREEN);
-    
-    ledc_set_duty(LEDC_MODE, LEDC_CH_BLUE, curB);
-    ledc_update_duty(LEDC_MODE, LEDC_CH_BLUE);
-    
-    vTaskDelay(pdMS_TO_TICKS(10));
+  if (twai_start() == ESP_OK) {
+    Serial.println("CAN started");
+  } else {
+    Serial.println("Failed to start CAN");
   }
 }
 
-// CAN Health Monitor Task
-void TaskCANHealth(void* parameter) {
-  Serial.println("[CANHEALTH] Task started");
-  uint32_t lastCheck = 0;
+void setupWiFi() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ap_ssid, ap_password);
   
-  while (true) {
-    uint32_t now = millis();
-    
-    if (now - lastCheck >= 1000) {
-      lastCheck = now;
-      
-      if (!can_started) {
-        g_ledState = LED_CAN_ERROR;
-      } else {
-        // Check CAN bus state
-        twai_status_info_t status;
-        if (twai_get_status_info(&status) == ESP_OK) {
-          if (status.state == TWAI_STATE_BUS_OFF || status.state == TWAI_STATE_RECOVERING) {
-            g_ledState = LED_CAN_ERROR;
-            Serial.println("[CANHEALTH] Bus error detected");
-          } else if (g_ledState != LED_CAN_ACTIVE) {
-            g_ledState = LED_CAN_ACTIVE;
-          }
-        }
-      }
-      
-      // Reset recent message counter
-      g_recentMessageCount = 0;
-    }
-    
-    vTaskDelay(pdMS_TO_TICKS(100));
-  }
-}
-
-void TaskCANTx(void* parameter) {
-  Serial.println("[CANTX] Task started");
-  uint32_t lastStatus = 0;
-  uint32_t lastHeartbeat = 0;
-  uint32_t lastSecTick = millis();
-
-  while (true) {
-    uint32_t now = millis();
-
-    if (now - lastSecTick >= 1000) {
-      lastSecTick += 1000;
-      if (g_uptimeSec < 0xFFFF) g_uptimeSec++;
-    }
-
-    if (now - lastStatus >= 500) {
-      lastStatus = now;
-      uint8_t buf[8] = {0};
-      buf[0] = SOFTWARE_VER;
-      buf[1] = (uint8_t)(g_uptimeSec & 0xFF);
-      buf[2] = (uint8_t)((g_uptimeSec >> 8) & 0xFF);
-      uint16_t msgs = (logCount > 0xFFFF) ? 0xFFFF : logCount;
-      buf[3] = (uint8_t)(msgs & 0xFF);
-      buf[4] = (uint8_t)((msgs >> 8) & 0xFF);
-      CAN_Send(make_can_id(API_TX_STATUS), buf, 8);
-    }
-
-    if (now - lastHeartbeat >= 100) {
-      lastHeartbeat = now;
-      uint8_t buf[8] = {0};
-      buf[0] = 0xAA;
-      buf[1] = (uint8_t)g_deviceNumber;
-      CAN_Send(make_can_id(API_TX_HEARTBEAT), buf, 8);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(5));
-  }
-}
-
-void TaskCANIDHelper(void* parameter) {
-  Serial.println("[CANID] Helper task started. Use &CANID SET xx / SAVE / GET");
-  while (true) {
-    if (Serial.available()) {
-      String line = Serial.readStringUntil('\n');
-      line.trim();
-
-      if (line.startsWith("&CANID SET ")) {
-        int val = line.substring(11).toInt();
-        if (val >= 0 && val <= 63) {
-          g_deviceNumber = (uint8_t)val;
-          Serial.printf("[CANID] Running DEVICE_NUMBER set to %d\n", (int)g_deviceNumber);
-        } else {
-          Serial.println("[CANID] Invalid value. Must be 0-63.");
-        }
-      } else if (line.equals("&CANID SAVE")) {
-        EEPROMSaveCANID();
-        Serial.println("[CANID] Saved to EEPROM. Rebooting...");
-        delay(1000);
-        ESP.restart();
-      } else if (line.equals("&CANID GET")) {
-        uint8_t eepromVal = EEPROM.read(0);
-        Serial.printf("[CANID] Current=%d, EEPROM=%d, Default=%d\n",
-                      (int)g_deviceNumber, (int)eepromVal, (int)DEFAULT_DEVICE_NUMBER);
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-}
-
-void setup() {
-  Serial.begin(115200);
-  delay(100);
-  Serial.println("\n=== adalogger with Status LEDs ===");
-  
-  startTime = millis();
-  
-  // Initialize LEDs first (booting state)
-  LED_Init();
-  g_ledState = LED_BOOTING;
-  
-  // EEPROM
-  EEPROM.begin(EEPROM_BYTES);
-  EEPROMReadCANID();
-  Serial.printf("[BOOT] DEVICE_NUMBER=%d\n", (int)g_deviceNumber);
-  
-  // Initialize CAN bus
-  if (!CAN_Start()) {
-    Serial.println("[BOOT] CAN init failed. Retrying in 3s...");
-    g_ledState = LED_CAN_ERROR;
-    delay(3000);
-    CAN_Start();
-  }
-  
-  // Setup WiFi AP
-  WiFi.softAP(ssid, password);
   IPAddress IP = WiFi.softAPIP();
-  Serial.print("[WIFI] AP IP: ");
+  Serial.print("AP IP address: ");
   Serial.println(IP);
   
-  // WiFi ready - change LED state
-  g_ledState = LED_WIFI_READY;
-  delay(500);
-  
-  // Once CAN is confirmed working, switch to active state
-  if (can_started) {
-    g_ledState = LED_CAN_ACTIVE;
-  }
-  
-  // Web server routes
-  server.on("/", handleRoot);
-  server.on("/data", handleData);
-  server.on("/clear", handleClear);
-  
-  server.begin();
-  Serial.println("[BOOT] Web server started");
-  
-  // Start tasks
-  xTaskCreatePinnedToCore(TaskLEDControl, "TaskLEDControl", 4096, nullptr, 2, nullptr, 1);
-  xTaskCreatePinnedToCore(TaskCANHealth, "TaskCANHealth", 4096, nullptr, 2, nullptr, 1);
-  xTaskCreatePinnedToCore(TaskCANTx, "TaskCANTx", 4096, nullptr, 2, nullptr, 1);
-  xTaskCreatePinnedToCore(TaskCANIDHelper, "TaskCANIDHelper", 4096, nullptr, 1, nullptr, 1);
-  
-  Serial.println("[BOOT] Setup complete");
+  setLED(0, 255, 0);  // Green = WiFi ready
 }
 
-void loop() {
-  server.handleClient();
-  
-  // Read CAN messages
-  if (can_started) {
-    twai_message_t message;
-    esp_err_t r = twai_receive(&message, pdMS_TO_TICKS(10));
-    if (r == ESP_OK) {
-      g_lastCANActivity = millis();
-      g_recentMessageCount++;
-      
-      logs[logIndex].id = message.identifier;
-      logs[logIndex].len = message.data_length_code;
-      logs[logIndex].is_extended = message.extd;
-      logs[logIndex].is_tx = false;
-      logs[logIndex].timestamp = millis() - startTime;
-      for (int i = 0; i < message.data_length_code && i < 8; ++i) {
-        logs[logIndex].data[i] = message.data[i];
+void setLED(int r, int g, int b) {
+  analogWrite(LED_R, 255 - r);
+  analogWrite(LED_G, 255 - g);
+  analogWrite(LED_B, 255 - b);
+}
+
+// === Web Server Handlers ===
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>adalogger</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&display=swap');
+    
+    :root {
+      --color-base: #0d181f;
+      --color-surface: #1f1d2e;
+      --color-overlay: #26233a;
+      --color-muted: #6e6a86;
+      --color-subtle: #908caa;
+      --color-text: #e0def4;
+      --color-love: #eb6f92;
+      --color-gold: #f6c177;
+      --color-rose: #ebbcba;
+      --color-pine: #31748f;
+      --color-foam: #9ccfd8;
+      --color-iris: #c4a7e7;
+      --hl-low: #21202e;
+      --hl-med: #403d52;
+      --hl-high: #524f67;
+    }
+    
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    body { 
+      font-family: 'Fira Code', monospace;
+      background: var(--color-base);
+      color: var(--color-text);
+      padding: 20px;
+      font-size: 14px;
+      line-height: 1.6;
+      position: relative;
+      min-height: 100vh;
+    }
+    
+    body::before {
+      content: "";
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: radial-gradient(circle at 50% 50%, rgba(156, 207, 216, 0.03) 0%, rgba(235, 111, 146, 0.02) 25%, rgba(196, 167, 231, 0.02) 50%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.6;
+    }
+    
+    .container { 
+      max-width: 1400px; 
+      margin: 0 auto;
+      position: relative;
+      z-index: 1;
+    }
+    
+    .glass {
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      background: rgba(255, 255, 255, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1), inset 0 1px rgba(255, 255, 255, 0.2);
+      position: relative;
+    }
+    
+    .glass::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.4), transparent);
+      pointer-events: none;
+    }
+    
+    .header { 
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    
+    h1 { 
+      color: var(--color-rose);
+      font-weight: 500;
+      margin-bottom: 8px;
+      font-size: 28px;
+      letter-spacing: 0.5px;
+    }
+    
+    .subtitle {
+      color: var(--color-subtle);
+      font-size: 13px;
+      font-weight: 300;
+    }
+    
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    
+    .stat-card {
+      padding: 20px;
+      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    
+    .stat-card:hover {
+      transform: translateY(-2px);
+      background: rgba(255, 255, 255, 0.12);
+    }
+    
+    .stat-label { 
+      color: var(--color-muted); 
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 8px;
+    }
+    
+    .stat-value { 
+      font-size: 32px; 
+      font-weight: 600;
+      background: linear-gradient(135deg, var(--color-foam), var(--color-iris));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    
+    .controls {
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    
+    h3 {
+      color: var(--color-foam);
+      font-weight: 400;
+      margin-bottom: 16px;
+      font-size: 16px;
+    }
+    
+    .btn {
+      background: rgba(255, 255, 255, 0.1);
+      color: var(--color-text);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      padding: 10px 20px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 500;
+      font-family: 'Fira Code', monospace;
+      font-size: 13px;
+      margin-right: 10px;
+      margin-bottom: 10px;
+      transition: all 0.3s ease;
+      backdrop-filter: blur(8px);
+      position: relative;
+      overflow: hidden;
+    }
+    
+    .btn::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: -100%;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+      transition: left 0.5s ease;
+    }
+    
+    .btn:hover {
+      background: rgba(255, 255, 255, 0.15);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    }
+    
+    .btn:hover::before {
+      left: 100%;
+    }
+    
+    .btn-primary {
+      background: linear-gradient(135deg, rgba(156, 207, 216, 0.2), rgba(156, 207, 216, 0.1));
+      border-color: rgba(156, 207, 216, 0.3);
+      color: var(--color-foam);
+    }
+    
+    .btn-danger { 
+      background: linear-gradient(135deg, rgba(235, 111, 146, 0.2), rgba(235, 111, 146, 0.1));
+      border-color: rgba(235, 111, 146, 0.3);
+      color: var(--color-love);
+    }
+    
+    input, select {
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--color-text);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      padding: 10px 14px;
+      border-radius: 8px;
+      margin-right: 10px;
+      margin-bottom: 10px;
+      font-family: 'Fira Code', monospace;
+      font-size: 13px;
+      backdrop-filter: blur(8px);
+      transition: all 0.3s ease;
+    }
+    
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--color-foam);
+      background: rgba(255, 255, 255, 0.08);
+      box-shadow: 0 0 0 3px rgba(156, 207, 216, 0.1);
+    }
+    
+    .message-list {
+      padding: 24px;
+      max-height: 600px;
+      overflow-y: auto;
+    }
+    
+    .message {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 16px;
+      margin-bottom: 12px;
+      border-radius: 8px;
+      border-left: 3px solid var(--color-foam);
+      font-size: 12px;
+      transition: all 0.2s ease;
+    }
+    
+    .message:hover {
+      background: rgba(255, 255, 255, 0.08);
+      transform: translateX(4px);
+    }
+    
+    .message.heartbeat { 
+      border-left-color: var(--color-love);
+      background: rgba(235, 111, 146, 0.05);
+    }
+    
+    .message-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      color: var(--color-foam);
+      font-weight: 500;
+    }
+    
+    .message-data { 
+      color: var(--color-text);
+      font-weight: 400;
+      margin-bottom: 6px;
+    }
+    
+    .decoded { 
+      color: var(--color-muted);
+      font-size: 11px;
+    }
+    
+    .filter-bar {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    
+    .divider {
+      margin: 24px 0;
+      border: none;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+    }
+    
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.05); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb { 
+      background: var(--color-foam); 
+      border-radius: 4px;
+      transition: background 0.3s ease;
+    }
+    ::-webkit-scrollbar-thumb:hover { background: var(--color-iris); }
+    
+    @media (max-width: 768px) {
+      .stats {
+        grid-template-columns: repeat(2, 1fr);
       }
       
-      logIndex = (logIndex + 1) % MAX_LOGS;
-      if (logCount < MAX_LOGS) logCount++;
+      .filter-bar {
+        flex-direction: column;
+      }
+      
+      input, select, .btn {
+        width: 100%;
+        margin-right: 0;
+      }
     }
-  }
-}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="glass header">
+      <h1>adalogger</h1>
+      <p class="subtitle">https://adabit.org | FRC CAN Bus Monitor</p>
+    </div>
 
-void handleRoot() {
-  String html = "<html><head><title>adalogger</title>";
-  html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<script>";
-  html += "function refresh(){fetch('/data').then(r=>r.text()).then(d=>{document.getElementById('log').innerHTML=d;})}";
-  html += "setInterval(refresh,500);";
-  html += "function clear(){fetch('/clear').then(()=>{document.getElementById('log').innerHTML='';document.getElementById('count').innerText='0';})}";
-  html += "</script></head><body>";
-  html += "<h1>adalogger</h1>";
-  html += "<p>Device Number: " + String(g_deviceNumber) + "</p>";
-  html += "<p>Uptime: " + String(g_uptimeSec) + "s</p>";
-  
-  // Status indicator
-  html += "<p>Status: ";
-  switch (g_ledState) {
-    case LED_BOOTING: html += "🔵 Booting"; break;
-    case LED_WIFI_READY: html += "🟢 WiFi Ready"; break;
-    case LED_CAN_ACTIVE: html += "🟢 CAN Active"; break;
-    case LED_CAN_ERROR: html += "🔴 CAN Error"; break;
-  }
-  html += "</p>";
-  
-  html += "<p>Messages: <span id='count'>0</span></p>";
-  html += "<button onclick='refresh()'>Refresh</button> ";
-  html += "<button onclick='clear()'>Clear</button><hr>";
-  html += "<div id='log'></div>";
-  html += "</body></html>";
+    <div class="stats">
+      <div class="glass stat-card">
+        <div class="stat-label">RX Messages</div>
+        <div class="stat-value" id="rxCount">0</div>
+      </div>
+      <div class="glass stat-card">
+        <div class="stat-label">TX Messages</div>
+        <div class="stat-value" id="txCount">0</div>
+      </div>
+      <div class="glass stat-card">
+        <div class="stat-label">Errors</div>
+        <div class="stat-value" id="errCount">0</div>
+      </div>
+      <div class="glass stat-card">
+        <div class="stat-label">Last Heartbeat</div>
+        <div class="stat-value" id="heartbeat">Never</div>
+      </div>
+    </div>
+
+    <div class="glass controls">
+      <h3>Controls</h3>
+      <button class="btn" onclick="clearMessages()">Clear Messages</button>
+      <button class="btn" onclick="toggleMonitoring()">
+        <span id="monitorBtn">Pause</span>
+      </button>
+      <button class="btn btn-danger" onclick="resetStats()">Reset Stats</button>
+      
+      <div class="divider"></div>
+      
+      <h3>Send CAN Message</h3>
+      <div>
+        <input type="text" id="canId" placeholder="CAN ID (hex)" value="0x0A081801">
+        <input type="text" id="canData" placeholder="Data (hex, space separated)" value="01 02 03 04">
+        <button class="btn btn-primary" onclick="sendMessage()">Send</button>
+      </div>
+    </div>
+
+    <div class="glass message-list">
+      <h3>CAN Messages</h3>
+      <div class="filter-bar">
+        <input type="text" id="filterID" placeholder="Filter by ID (hex)" onkeyup="applyFilter()">
+        <select id="filterType" onchange="applyFilter()">
+          <option value="all">All Messages</option>
+          <option value="heartbeat">Heartbeat Only</option>
+          <option value="no-heartbeat">No Heartbeat</option>
+        </select>
+      </div>
+      <div id="messages"></div>
+    </div>
+  </div>
+
+  <script>
+    let monitoring = true;
+    let allMessages = [];
+
+    function updateStats() {
+      fetch('/stats')
+        .then(r => r.json())
+        .then(data => {
+          document.getElementById('rxCount').textContent = data.rx;
+          document.getElementById('txCount').textContent = data.tx;
+          document.getElementById('errCount').textContent = data.err;
+          if (data.lastHeartbeat > 0) {
+            let ago = ((Date.now() - data.lastHeartbeat) / 1000).toFixed(1);
+            document.getElementById('heartbeat').textContent = ago + 's ago';
+          }
+        });
+    }
+
+    function updateMessages() {
+      if (!monitoring) return;
+      
+      fetch('/messages')
+        .then(r => r.json())
+        .then(data => {
+          allMessages = data;
+          applyFilter();
+        });
+    }
+
+    function applyFilter() {
+      let filterID = document.getElementById('filterID').value.toLowerCase();
+      let filterType = document.getElementById('filterType').value;
+      
+      let filtered = allMessages.filter(msg => {
+        let idMatch = !filterID || msg.id.toLowerCase().includes(filterID);
+        let typeMatch = filterType === 'all' || 
+                       (filterType === 'heartbeat' && msg.id === '0x01011840') ||
+                       (filterType === 'no-heartbeat' && msg.id !== '0x01011840');
+        return idMatch && typeMatch;
+      });
+      
+      displayMessages(filtered);
+    }
+
+    function displayMessages(messages) {
+      let html = '';
+      messages.slice(-100).reverse().forEach(msg => {
+        let isHeartbeat = msg.id === '0x01011840';
+        html += `
+          <div class="message ${isHeartbeat ? 'heartbeat' : ''}">
+            <div class="message-header">
+              <span>ID: ${msg.id} ${isHeartbeat ? '(HEARTBEAT)' : ''}</span>
+              <span>${msg.timestamp}ms</span>
+            </div>
+            <div class="message-data">
+              Data [${msg.len}]: ${msg.data}
+            </div>
+            ${msg.decoded ? `<div class="decoded">${msg.decoded}</div>` : ''}
+          </div>
+        `;
+      });
+      document.getElementById('messages').innerHTML = html || '<p style="color:var(--color-muted)">No messages</p>';
+    }
+
+    function clearMessages() {
+      fetch('/clear', {method: 'POST'});
+      allMessages = [];
+      applyFilter();
+    }
+
+    function toggleMonitoring() {
+      monitoring = !monitoring;
+      document.getElementById('monitorBtn').textContent = monitoring ? 'Pause' : 'Resume';
+    }
+
+    function resetStats() {
+      fetch('/reset', {method: 'POST'});
+    }
+
+    function sendMessage() {
+      let id = document.getElementById('canId').value;
+      let data = document.getElementById('canData').value;
+      
+      fetch('/send', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: `id=${encodeURIComponent(id)}&data=${encodeURIComponent(data)}`
+      })
+      .then(r => r.text())
+      .then(msg => alert(msg));
+    }
+
+    setInterval(updateStats, 1000);
+    setInterval(updateMessages, 500);
+    updateStats();
+    updateMessages();
+  </script>
+</body>
+</html>
+)rawliteral";
   
   server.send(200, "text/html", html);
 }
 
-void handleData() {
-  String response = "";
+void handleStats() {
+  StaticJsonDocument<200> doc;
+  doc["rx"] = rxCount;
+  doc["tx"] = txCount;
+  doc["err"] = errCount;
+  doc["lastHeartbeat"] = lastHeartbeat;
   
-  int start = (logCount < MAX_LOGS) ? 0 : logIndex;
-  int count = (logCount < MAX_LOGS) ? logCount : MAX_LOGS;
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+void handleMessages() {
+  DynamicJsonDocument doc(20000);
+  JsonArray messages = doc.to<JsonArray>();
   
-  response += "<table border='1'><tr><th>Dir</th><th>Time(ms)</th><th>ID</th><th>Type</th><th>API</th><th>DN</th><th>Data</th></tr>";
-  
-  for (int i = 0; i < count; i++) {
-    int idx = (start + i) % MAX_LOGS;
-    CANLog* log = &logs[idx];
+  for (int i = 0; i < min(bufferIndex, MAX_MESSAGES); i++) {
+    JsonObject msg = messages.createNestedObject();
     
-    response += "<tr>";
-    response += "<td>" + String(log->is_tx ? "TX" : "RX") + "</td>";
-    response += "<td>" + String(log->timestamp) + "</td>";
-    response += "<td>0x" + String(log->id, HEX) + "</td>";
+    char idStr[16];
+    sprintf(idStr, "0x%08X", messageBuffer[i].id);
+    msg["id"] = idStr;
     
-    if (log->is_extended) {
-      uint8_t deviceType, manufacturer, deviceNumber;
-      uint16_t apiClass;
-      decode_id(log->id, deviceType, manufacturer, apiClass, deviceNumber);
-      
-      if (deviceType == DEVICE_ID && manufacturer == MANUFACTURER_ID) {
-        response += "<td>FRC</td>";
-        response += "<td>" + getAPIClassName(apiClass) + "</td>";
-        response += "<td>" + String(deviceNumber) + "</td>";
-      } else {
-        response += "<td>Ext</td>";
-        response += "<td>DT:" + String(deviceType, HEX) + " MFG:" + String(manufacturer, HEX) + "</td>";
-        response += "<td>" + String(deviceNumber) + "</td>";
-      }
-    } else {
-      response += "<td>Std</td><td>-</td><td>-</td>";
+    String dataStr = "";
+    for (int j = 0; j < messageBuffer[i].len; j++) {
+      char byte[4];
+      sprintf(byte, "%02X ", messageBuffer[i].data[j]);
+      dataStr += byte;
     }
+    msg["data"] = dataStr;
+    msg["len"] = messageBuffer[i].len;
+    msg["timestamp"] = messageBuffer[i].timestamp;
     
-    response += "<td>";
-    for (int j = 0; j < log->len; j++) {
-      if (j > 0) response += " ";
-      if (log->data[j] < 0x10) response += "0";
-      response += String(log->data[j], HEX);
+    // Decode FRC CAN if not heartbeat
+    if (messageBuffer[i].id != HEARTBEAT_ID) {
+      DecodedCANID decoded = decodeCANMsgID(messageBuffer[i].id);
+      char decodedStr[128];
+      sprintf(decodedStr, "Dev:0x%02X Mfr:0x%02X API:0x%03X #%d", 
+              decoded.deviceID, decoded.manufacturerID, 
+              decoded.apiID, decoded.deviceNumber);
+      msg["decoded"] = decodedStr;
     }
-    response += "</td></tr>";
   }
   
-  response += "</table>";
-  response += "<script>document.getElementById('count').innerText=" + String(logCount) + ";</script>";
-  
-  server.send(200, "text/html", response);
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
 }
 
 void handleClear() {
-  logIndex = 0;
-  logCount = 0;
-  startTime = millis();
-  server.send(200, "text/plain", "OK");
+  bufferIndex = 0;
+  totalMessages = 0;
+  bufferOverflow = false;
+  server.send(200, "text/plain", "Messages cleared");
 }
 
-String getAPIClassName(uint16_t apiClass) {
-  switch(apiClass) {
-    case API_CLASS_ROBOT_CONTROL: return "RobotCtrl";
-    case API_CLASS_MOTOR_CONTROL: return "Motor";
-    case API_CLASS_RELAY_CONTROL: return "Relay";
-    case API_CLASS_GYRO_SENSOR: return "Gyro";
-    case API_CLASS_ACCEL_SENSOR: return "Accel";
-    case API_CLASS_ULTRASONIC: return "Ultrasonic";
-    case API_CLASS_GEAR_TOOTH: return "GearTooth";
-    case API_CLASS_MISC_SENSOR: return "Sensor";
-    case API_CLASS_IO_CONFIG: return "IOConfig";
-    case API_CLASS_POWER: return "Power";
-    case API_CLASS_FIRMWARE: return "Firmware";
-    case 0x185: return "RX_CONTROL";
-    case 0x186: return "RX_STATUS";
-    case 0x195: return "TX_INPUTS";
-    case 0x196: return "TX_RESET";
-    case API_TX_STATUS: return "LOGGER_STATUS";
-    case API_TX_HEARTBEAT: return "LOGGER_HB";
-    default: return "0x" + String(apiClass, HEX);
+void handleReset() {
+  rxCount = 0;
+  txCount = 0;
+  errCount = 0;
+  lastHeartbeat = 0;
+  server.send(200, "text/plain", "Stats reset");
+}
+
+void handleSend() {
+  if (server.hasArg("id") && server.hasArg("data")) {
+    String idStr = server.arg("id");
+    String dataStr = server.arg("data");
+    
+    uint32_t canId = strtoul(idStr.c_str(), NULL, 16);
+    
+    twai_message_t message;
+    message.identifier = canId;
+    message.extd = 1;
+    message.rtr = 0;
+    message.ss = 0;
+    message.self = 0;
+    message.dlc_non_comp = 0;
+    
+    // Parse data bytes
+    int dataLen = 0;
+    char* token = strtok((char*)dataStr.c_str(), " ");
+    while (token != NULL && dataLen < 8) {
+      message.data[dataLen++] = strtoul(token, NULL, 16);
+      token = strtok(NULL, " ");
+    }
+    message.data_length_code = dataLen;
+    
+    if (twai_transmit(&message, pdMS_TO_TICKS(100)) == ESP_OK) {
+      txCount++;
+      server.send(200, "text/plain", "Message sent successfully");
+    } else {
+      server.send(500, "text/plain", "Failed to send message");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing parameters");
+  }
+}
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/stats", handleStats);
+  server.on("/messages", handleMessages);
+  server.on("/clear", HTTP_POST, handleClear);
+  server.on("/reset", HTTP_POST, handleReset);
+  server.on("/send", HTTP_POST, handleSend);
+  
+  server.begin();
+  Serial.println("Web server started");
+}
+
+// === Main Setup ===
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\nESP32 CAN Debug Tool Starting...");
+  
+  // Setup LEDs
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+  setLED(255, 0, 0);  // Red = starting
+  
+  // Setup WiFi
+  setupWiFi();
+  
+  // Setup CAN
+  setupCAN();
+  
+  // Setup Web Server
+  setupWebServer();
+  
+  setLED(0, 0, 255);  // Blue = ready
+  Serial.println("System ready!");
+  Serial.printf("Connect to WiFi: %s\n", ap_ssid);
+  Serial.printf("Password: %s\n", ap_password);
+  Serial.printf("Open browser to: http://%s\n", WiFi.softAPIP().toString().c_str());
+}
+
+// === Main Loop ===
+void loop() {
+  server.handleClient();
+  
+  // Check for CAN messages
+  twai_message_t message;
+  if (twai_receive(&message, pdMS_TO_TICKS(10)) == ESP_OK) {
+    rxCount++;
+    
+    // Store in buffer
+    if (bufferIndex < MAX_MESSAGES) {
+      messageBuffer[bufferIndex].id = message.identifier;
+      messageBuffer[bufferIndex].len = message.data_length_code;
+      messageBuffer[bufferIndex].extended = message.extd;
+      messageBuffer[bufferIndex].timestamp = millis();
+      memcpy(messageBuffer[bufferIndex].data, message.data, message.data_length_code);
+      bufferIndex++;
+    } else {
+      bufferOverflow = true;
+      // Shift buffer (keep last 500 messages)
+      memmove(&messageBuffer[0], &messageBuffer[1], sizeof(CANMessage) * (MAX_MESSAGES - 1));
+      messageBuffer[MAX_MESSAGES - 1].id = message.identifier;
+      messageBuffer[MAX_MESSAGES - 1].len = message.data_length_code;
+      messageBuffer[MAX_MESSAGES - 1].extended = message.extd;
+      messageBuffer[MAX_MESSAGES - 1].timestamp = millis();
+      memcpy(messageBuffer[MAX_MESSAGES - 1].data, message.data, message.data_length_code);
+    }
+    
+    totalMessages++;
+    
+    // Check for heartbeat
+    if (message.identifier == HEARTBEAT_ID) {
+      lastHeartbeat = millis();
+      setLED(255, 0, 255);  // Flash magenta on heartbeat
+      delay(50);
+      setLED(0, 0, 255);
+    }
+  }
+  
+  // Check for errors
+  twai_status_info_t status;
+  if (twai_get_status_info(&status) == ESP_OK) {
+    if (status.state == TWAI_STATE_BUS_OFF) {
+      errCount++;
+      twai_initiate_recovery();
+    }
   }
 }
