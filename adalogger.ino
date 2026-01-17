@@ -19,6 +19,19 @@ const char* ap_password = "Team1157!";
 // === FRC CAN Constants ===
 #define HEARTBEAT_ID 0x01011840
 
+// === Device Identity Configuration ===
+#define OUR_DEVICE_TYPE 0x0A        // Miscellaneous
+#define OUR_MANUFACTURER 0x08       // Team Use
+#define OUR_DEVICE_NUMBER 0x01      // Device #1
+#define STATUS_API_CLASS 0x05       // Status API Class
+#define STATUS_API_INDEX 0x00       // General Status
+
+// Periodic message timing
+#define STATUS_PERIOD_MS 100        // Send status every 100ms
+uint32_t lastStatusTime = 0;
+bool canEnabled = false;
+uint32_t lastHeartbeatReceived = 0;
+
 // === Web Server ===
 WebServer server(80);
 
@@ -145,6 +158,59 @@ uint32_t makeCANMsgID(uint8_t deviceID, uint8_t manufacturerID, uint16_t apiID, 
          (deviceNumber & 0x3F);
 }
 
+// === Device Presence Functions ===
+void sendPeriodicStatus() {
+  // Create our device status message
+  uint32_t ourID = makeCANMsgID(OUR_DEVICE_TYPE, OUR_MANUFACTURER, 
+                                 (STATUS_API_CLASS << 4) | STATUS_API_INDEX, 
+                                 OUR_DEVICE_NUMBER);
+  
+  twai_message_t message;
+  message.identifier = ourID;
+  message.extd = 1;
+  message.rtr = 0;
+  message.ss = 0;
+  message.self = 0;
+  message.dlc_non_comp = 0;
+  message.data_length_code = 8;
+  
+  // Status data payload
+  message.data[0] = canEnabled ? 0x01 : 0x00;  // Enabled status
+  message.data[1] = (rxCount >> 8) & 0xFF;     // Message count high byte
+  message.data[2] = rxCount & 0xFF;            // Message count low byte
+  message.data[3] = deviceCount;               // Number of devices we see
+  message.data[4] = WiFi.softAPGetStationNum(); // Number of WiFi clients
+  message.data[5] = 0x01;                      // Firmware version major
+  message.data[6] = 0x00;                      // Firmware version minor
+  message.data[7] = 0x00;                      // Reserved
+  
+  if (twai_transmit(&message, pdMS_TO_TICKS(10)) == ESP_OK) {
+    txCount++;
+  }
+}
+
+void processHeartbeat(const twai_message_t& message) {
+  if (message.data_length_code >= 8) {
+    // Parse the heartbeat data according to FRC spec
+    uint8_t byte5 = message.data[4];
+    
+    // Extract enabled and system watchdog bits
+    bool enabled = (byte5 & 0x04) != 0;        // Enabled bit
+    bool systemWatchdog = (byte5 & 0x08) != 0; // System watchdog bit
+    
+    // Device is enabled if both enabled flag is set AND system watchdog is active
+    canEnabled = enabled && systemWatchdog;
+    lastHeartbeatReceived = millis();
+  }
+}
+
+void checkHeartbeatTimeout() {
+  // If we haven't received a heartbeat in 100ms, consider the robot disabled
+  if (millis() - lastHeartbeatReceived > 100 && lastHeartbeatReceived > 0) {
+    canEnabled = false;
+  }
+}
+
 // === Setup Functions ===
 void setupCAN() {
   twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
@@ -192,7 +258,6 @@ void handleRoot() {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>adalog</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@300;400;500;600&display=swap');
     
     :root {
       --color-base: #0d181f;
@@ -617,6 +682,14 @@ void handleRoot() {
             <div class="stat-label">Last Heartbeat</div>
             <div class="stat-value" id="heartbeat">Never</div>
           </div>
+          <div class="stat-card">
+            <div class="stat-label">CAN Status</div>
+            <div class="stat-value" id="canStatus" style="font-size: 20px;">Disabled</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Our Device ID</div>
+            <div class="stat-value" id="ourDeviceID" style="font-size: 16px;">--</div>
+          </div>
         </div>
       </div>
 
@@ -673,6 +746,21 @@ void handleRoot() {
           if (data.lastHeartbeat > 0) {
             let ago = ((Date.now() - data.lastHeartbeat) / 1000).toFixed(1);
             document.getElementById('heartbeat').textContent = ago + 's ago';
+          }
+          
+          // Update CAN status
+          let statusEl = document.getElementById('canStatus');
+          if (data.canEnabled) {
+            statusEl.textContent = 'Enabled';
+            statusEl.style.color = 'var(--color-foam)';
+          } else {
+            statusEl.textContent = 'Disabled';
+            statusEl.style.color = 'var(--color-muted)';
+          }
+          
+          // Update our device ID
+          if (data.ourDeviceID) {
+            document.getElementById('ourDeviceID').textContent = data.ourDeviceID;
           }
         });
     }
@@ -835,11 +923,21 @@ void handleRoot() {
 }
 
 void handleStats() {
-  StaticJsonDocument<200> doc;
+  StaticJsonDocument<256> doc;
   doc["rx"] = rxCount;
   doc["tx"] = txCount;
   doc["err"] = errCount;
   doc["lastHeartbeat"] = lastHeartbeat;
+  doc["canEnabled"] = canEnabled;
+  doc["devicePresent"] = true;
+  
+  // Add our device ID
+  char ourIDStr[16];
+  uint32_t ourID = makeCANMsgID(OUR_DEVICE_TYPE, OUR_MANUFACTURER, 
+                                 (STATUS_API_CLASS << 4) | STATUS_API_INDEX, 
+                                 OUR_DEVICE_NUMBER);
+  sprintf(ourIDStr, "0x%08X", ourID);
+  doc["ourDeviceID"] = ourIDStr;
   
   String response;
   serializeJson(doc, response);
@@ -998,11 +1096,29 @@ void setup() {
   Serial.printf("Connect to WiFi: %s\n", ap_ssid);
   Serial.printf("Password: %s\n", ap_password);
   Serial.printf("Open browser to: http://%s\n", WiFi.softAPIP().toString().c_str());
+  
+  // Print our CAN ID
+  uint32_t ourID = makeCANMsgID(OUR_DEVICE_TYPE, OUR_MANUFACTURER, 
+                                 (STATUS_API_CLASS << 4) | STATUS_API_INDEX, 
+                                 OUR_DEVICE_NUMBER);
+  Serial.printf("Our CAN ID: 0x%08X\n", ourID);
+  Serial.printf("Device Type: %s (0x%02X)\n", getDeviceTypeName(OUR_DEVICE_TYPE), OUR_DEVICE_TYPE);
+  Serial.printf("Manufacturer: %s (0x%02X)\n", getManufacturerName(OUR_MANUFACTURER), OUR_MANUFACTURER);
+  Serial.printf("Device Number: %d\n", OUR_DEVICE_NUMBER);
 }
 
 // === Main Loop ===
 void loop() {
   server.handleClient();
+  
+  // Send periodic status message
+  if (millis() - lastStatusTime >= STATUS_PERIOD_MS) {
+    sendPeriodicStatus();
+    lastStatusTime = millis();
+  }
+  
+  // Check for heartbeat timeout
+  checkHeartbeatTimeout();
   
   // Check for CAN messages
   twai_message_t message;
@@ -1038,9 +1154,10 @@ void loop() {
     // Check for heartbeat
     if (message.identifier == HEARTBEAT_ID) {
       lastHeartbeat = millis();
+      processHeartbeat(message);  // Process heartbeat data
       setLED(255, 0, 255);  // Flash magenta on heartbeat
       delay(50);
-      setLED(0, 0, 255);
+      setLED(canEnabled ? 0 : 255, canEnabled ? 255 : 255, 0);  // Green if enabled, yellow if disabled
     }
   }
   
@@ -1063,4 +1180,4 @@ void loop() {
       twai_initiate_recovery();
     }
   }
-}
+}3
