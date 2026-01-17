@@ -179,7 +179,7 @@ void sendPeriodicStatus() {
   message.data[1] = (rxCount >> 8) & 0xFF;     // Message count high byte
   message.data[2] = rxCount & 0xFF;            // Message count low byte
   message.data[3] = deviceCount;               // Number of devices we see
-  message.data[4] = WiFi.softAPGetStationNum(); // Number of WiFi clients
+  message.data[4] = WiFi.softAPgetStationNum(); // Number of WiFi clients
   message.data[5] = 0x01;                      // Firmware version major
   message.data[6] = 0x00;                      // Firmware version minor
   message.data[7] = 0x00;                      // Reserved
@@ -1180,4 +1180,4 @@ void loop() {
       twai_initiate_recovery();
     }
   }
-}3
+}
